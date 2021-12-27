@@ -2,190 +2,322 @@
 #include <assert.h>
 #include <iostream>
 #include <sstream>
+#include <functional>
+#include <cassert>
 
-namespace kThreadPool {
+namespace kthreadpool {
 
-	void Worker::Start()
+	ThreadPool::Worker::Worker(ThreadPool *p, int64_t id) : pool_(p), id_(id) 
 	{
-		if (!start_)
-			thread_ = new std::thread(std::bind(&Worker::run, this));
-		start_ = true;
+		shutdown_ = true;
 	}
 
-	void Worker::Stop()
+	ThreadPool::Worker::~Worker()
 	{
-		if (start_)
-		{
-			start_ = false;
+	}
+
+	void ThreadPool::Worker::Start()
+	{
+		bool expect = true;
+		if (shutdown_.compare_exchange_strong(expect, false))
+			thread_ = std::make_shared<std::thread>(std::thread(std::bind(&Worker::Run, this)));
+	}
+
+	bool ThreadPool::Worker::Shutdown()
+	{
+		bool expect = false;
+		return shutdown_.compare_exchange_strong(expect, true);
+	}
+
+	void ThreadPool::Worker::Wait()
+	{
+		if (thread_->joinable())
 			thread_->join();
-			thread_ = nullptr;
-		}
 	}
 
-	void Worker::Run()
+	bool ThreadPool::Worker::IsShutdown()
+	{
+		return shutdown_;
+	}
+
+	void ThreadPool::Worker::Run()
 	{
 		pool_->Run(this);
 	}
 
-	int64_t Worker::GetId() const
+	int64_t ThreadPool::Worker::GetId() const
 	{
 		return id_;
 	}
 
-
 	// ThreadPool
-	ThreadPool::ThreadPool(int min_threads_size, int max_threads_size)
-		: min_thread_size_(min_threads_size),
-		max_threads_size_(max_threads_size),
-		is_started_(false), thread_size_(0) 
+	ThreadPool::ThreadPool(ThreadPoolSettings settings)
+		: settings_(settings), available_workers_size_(0), 
+		thread_id_generator_(0),
+		shutdown_(true)
 	{
 	}
 
 	ThreadPool::~ThreadPool() 
 	{
-		if (is_started_) {
-			Stop();
-		}
+		Stop();
+	}
+
+	bool ThreadPool::Shutdown() 
+	{
+		bool expect = false;
+		return shutdown_.compare_exchange_strong(expect, true);
 	}
 
 	void ThreadPool::Start() 
 	{
-		if (IsStarted())
+		std::unique_lock<std::mutex> lock(thread_mutex_);
+
+		if (!IsShutdown())
 			return;
 
-		assert(threads_.empty());
-		is_started_ = true;
-		for (int i = 0; i < threads_size_; ++i) 
+		assert(workers_.empty());
+		shutdown_ = false;
+
+		for (size_t i = 0; i < settings_.MinThreadSize(); ++i) 
 		{
+			available_workers_size_++;
 			auto id = ++thread_id_generator_;
 			auto w = std::make_shared<Worker>(this, id);
-			workers_[w.GetId()] = w;
+			workers_[w->GetId()] = w;
 			w->Start();
 		}
 	}
 
-	void ThreadPool::stop() 
+	void ThreadPool::Stop() 
 	{
-		if (!IsStarted())
+		if (!Shutdown())
 			return;
 
-		{   // scope block : avoid deadlock
-			is_started_ = false;
-			std::unique_lock<std::mutex> lock(mutex_);
+		{   // avoid deadlock
+			std::unique_lock<std::mutex> lock(queue_mutex_);
 			in_queue_cond_.notify_all();
-			out_queue_cond.notify_all();
+			out_queue_cond_.notify_all();
 		}
 		
-		std::unique_lock<std::mutex> lock(thread_mutex_);
-		for (auto& it : workers_)
-		{
-			it.second->Stop();
-		}
-		workers_.clear();
+		GcWorkers();
 	}
 
-	void ThreadPool::Schedule(const TaskFunc& func, void* arg)
+	void ThreadPool::Wait()
 	{
-		std::unique_lock<std::mutex> lock(mutex_);
-		while (queue_.size() >= max_queue_size_ && IsStarted())
-		{
-			out_queue_cond.wait(&lock);
-		}
-
-		if (IsStarted())
-		{
-			queue_.emplace_back(func, arg);
-			in_queue_cond_.notify_one();
-		}
+		std::unique_lock<std::mutex> lock(queue_mutex_);
+		wait_cond_.wait(lock, [&](){
+			return queue_.empty() && delay_queue_.empty();
+		});
 	}
 
-	// @TODO expand thread
-	void ScheduleDelay(const TaskFunc& func, void* arg, std::chrono::milliseconds timeout)
+	std::chrono::system_clock::time_point ThreadPool::TimeAddDuration(std::chrono::system_clock::time_point tp, std::chrono::nanoseconds duration)
 	{
-		auto exec_time = std::chrono::system_clock::now() + timeout;
+		if (max_system_clock_ - duration > tp)
+			tp = tp + duration; 
+		else
+			tp = max_system_clock_;
+		return tp;
+	}
+
+	size_t ThreadPool::ThreadSize()
+	{
+		return available_workers_size_;
+	}
+
+	StatusCode ThreadPool::scheduleTask(const TaskFunc& func, std::chrono::nanoseconds timeout)
+	{
+		auto now = std::chrono::system_clock::now();
+		auto expire_time = TimeAddDuration(now, timeout);
+		auto timeout_time = expire_time;
+
+		std::unique_lock<std::mutex> lock(queue_mutex_);
+		while (queue_.size() >= settings_.MaxQueueSize() && !IsShutdown())
+		{
+			if (available_workers_size_ < settings_.max_thread_size_)
+				expire_time = std::min(expire_time, TimeAddDuration(std::chrono::system_clock::now(), settings_.increase_thread_duration_));
+
+			if (out_queue_cond_.wait_until(lock, expire_time) == std::cv_status::timeout)
+			{
+				if (std::chrono::system_clock::now() >= timeout_time)
+					return StatusCode::Timeout;
+				TryIncreaseThreads();
+				GcIdleWorkers();
+			}
+		}
+
+		if (IsShutdown())
+			return StatusCode::Closed;
+
+		queue_.push(Task(func));
+		in_queue_cond_.notify_one();
 		
-		std::unique_lock<std::mutex> lock(mutex_);
-		if (IsStarted())
+		return StatusCode::Ok;
+	}
+
+	StatusCode ThreadPool::scheduleDelayTask(const TaskFunc& func, std::chrono::nanoseconds delay_duration, std::chrono::nanoseconds timeout)
+	{
+		auto now = std::chrono::system_clock::now();
+		auto expire_time = TimeAddDuration(now, timeout);
+		auto timeout_time = expire_time;
+
+		std::unique_lock<std::mutex> lock(queue_mutex_);
+		while (delay_queue_.size() >= settings_.MaxDelayQueueSize() && !IsShutdown())
 		{
-			time_queue_.emplace_back(func, arg, exec_time);
-			in_queue_cond_.notify_one();
+			if (available_workers_size_ < settings_.max_thread_size_)
+				expire_time = std::min(expire_time, TimeAddDuration(std::chrono::system_clock::now(), settings_.increase_thread_duration_));
+
+			if (out_queue_cond_.wait_until(lock, expire_time) == std::cv_status::timeout)
+			{
+				if (std::chrono::system_clock::now() >= timeout_time)
+					return StatusCode::Timeout;
+				TryIncreaseThreads();
+				GcIdleWorkers();
+			}
 		}
+
+		if (IsShutdown())
+			return StatusCode::Closed;
+
+		auto exec_time = std::chrono::system_clock::now() + delay_duration;
+		delay_queue_.push(TimeTask(func, exec_time));
+		in_queue_cond_.notify_one();
+		
+		return StatusCode::Ok;
 	}
 
-	bool ThreadPool::CanShrinkIdle()
+	size_t ThreadPool::QueueSize()
 	{
-		return (thread_size_ > min_thread_size_)
+		std::unique_lock<std::mutex> lock(queue_mutex_);
+		return queue_.size();
+	}
+	
+	size_t ThreadPool::DelayQueueSize()
+	{
+		std::unique_lock<std::mutex> lock(queue_mutex_);
+		return delay_queue_.size();
 	}
 
-	void ThreadPool::ShrinkIdle(Worker* worker)
+	void ThreadPool::TryIncreaseThreads()
 	{
-		auto id = worker->GetId();
-
 		std::unique_lock<std::mutex> lock(thread_mutex_);
-		auto it = workers_.find(id);
-		if (workers_.end() == it)
+		if (workers_.size() >= settings_.MaxThreadSize())
 			return;
-		
-		it.second->Stop();
-		workers_.erase(it);
-		thread_size_--;
+		available_workers_size_++;
+		auto id = ++thread_id_generator_;
+		auto w = std::make_shared<Worker>(this, id);
+		workers_[w->GetId()] = w;
+		w->Start();
+	}
+
+	void ThreadPool::Execute(const Task& task)
+	{
+		(task.func)();
+		{
+			std::unique_lock<std::mutex> lock(queue_mutex_);
+			if (queue_.empty() && delay_queue_.empty())
+				wait_cond_.notify_all();
+		}
+	}
+
+	void ThreadPool::GcIdleWorkers()
+	{
+		std::vector<std::shared_ptr<Worker>> gc_workers;
+		{
+			std::unique_lock<std::mutex> lock(thread_mutex_);
+			for (auto it = workers_.begin(); it != workers_.end();)
+			{
+				if (it->second->IsShutdown())
+				{
+					gc_workers.push_back(it->second);
+					it = workers_.erase(it);
+				} else {
+					it++;
+				}
+			}
+		}
+		for (auto& w : gc_workers)
+		{
+			w->Wait();
+		}
+	}
+
+	void ThreadPool::GcWorkers()
+	{
+		std::vector<std::shared_ptr<Worker>> gc_workers;
+		{
+			std::unique_lock<std::mutex> lock(thread_mutex_);
+			for (auto it = workers_.begin(); it != workers_.end(); it++)
+			{
+				gc_workers.push_back(it->second);
+				it->second->Shutdown();
+			}
+			workers_.clear();
+		}
+		for (auto& w : gc_workers)
+		{
+			w->Wait();
+		}
 	}
 
 	void ThreadPool::Run(Worker* worker)
 	{
-		while (IsStarted()) 
+		while (true) 
 		{
-			mutex_.lock();
-			if (queue_.empty() && time_queue_.empty() && IsStarted())
+			std::unique_lock<std::mutex> lock(queue_mutex_);		
+			std::cv_status cv_status = std::cv_status::no_timeout;	
+			if (queue_.empty() && delay_queue_.empty() && !IsShutdown() && !worker->IsShutdown())
 			{
-				in_queue_cond_.wait_for(lock, idle_duration_);
+				cv_status = in_queue_cond_.wait_for(lock, settings_.IdleThreadDuration());
 			}
-			if (!IsStarted())
+			if (IsShutdown() || worker->IsShutdown())
 			{
-				mutex_.unlock();
-				return;
+				available_workers_size_--;
+				break;
 			}
-			
-			if (queue_.empty() && time_queue_.empty())
-			{
-				if (CanShrinkIdle())
-				{
-					ShrinkIdle(worker);
-				}
 				
-				mutex_.unlock();
-				return;
+			if (queue_.empty() && delay_queue_.empty() && cv_status == std::cv_status::timeout)
+			{
+				auto size = available_workers_size_.load();
+				if (size > settings_.MinThreadSize())
+				{
+					if (available_workers_size_.compare_exchange_strong(size, size-1))
+					{
+						worker->Shutdown();
+						break;
+					}
+				}
 			}
 
-			if (!time_queue_.empty())
+			if (!delay_queue_.empty())
 			{
-				auto task = time_queue_.top();
+				auto task = delay_queue_.top();
 				auto now = std::chrono::system_clock::now();
 				if (task.exec_time < now)
 				{
-					time_queue_.pop();
-					mutex_.unlock();
+					delay_queue_.pop();
+					lock.unlock();
 					
-					(*task.func)(task.arg);
+					Execute(task);
 					continue;
 				} 
 				if (queue_.empty())
 				{
 					auto wait = task.exec_time - now;
-					in_queue_cond_.wait_for(lock, wait, [](){
+					in_queue_cond_.wait_for(lock, wait, [&](){
 						return !queue_.empty();
 					});
 
-					mutex_.unlock();
 					continue;
 				}
 			}
 			if (!queue_.empty())
 			{
-				auto task = queue_.pop();
+				auto task = queue_.front();
+				queue_.pop();
 				out_queue_cond_.notify_one();
-				mutex_.unlock();
-				(*task.func)(task.arg);
+				lock.unlock();
+				Execute(task);
 			}
 		}
 	}
